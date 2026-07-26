@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// TODO migrate from nodejs to bare runtime
+// TODO:01(future) migrate from nodejs to bare runtime
 //const spawn = require('bare-runtime/spawn')
 //spawn(__filename, { args: [require.resolve('./cli.js'), ...process.argv.slice(2)] })
 /*****************************************************************************/
 const { spawn } = require('node:child_process')
-const fs = require('node:fs/promises')
+const filesystem = require('node:fs')
 const path = require('node:path')
 const net = require('node:net')
 /*****************************************************************************/
@@ -13,81 +13,41 @@ const crypto = require('hypercore-crypto')
 const hyperdrive = require('hyperdrive')
 const corestore = require('corestore')
 const hyperbee = require('hyperbee')
+const b4a = require('b4a')
+/*****************************************************************************/
+const fs = filesystem.promises
+const pkg = require('./package.json')
+const NAME = pkg.name//.toUpperCase()
+const { version } = pkg
+// TODO:02(soon): bump version + investigate why no data was persisted on VPS
+// TODO:03(last): timestamp for boot in lockfile and on termination or deletion log it
+// TODO:04(later): add proper hypercore based logger + reporter, merged with corestore
+// TODO:05(future): allow "global installing" new cli sub commands to operate on .vm?
+/*****************************************************************************/
+const api = module.exports = { run, see, end }
+if (require.main === module) cli().catch(onerror)
 /******************************************************************************
   CLI
 /*****************************************************************************/
-module.exports = (async function cli () {
-  const api = { run, see, end }
-  if (require.main !== module) return api
-  goodbye(onshutdown)
-  const { env } = process
-  const is_daemon = ('OPTS' in env) && (Object.keys(env).length === 1)
-
-
-// TODO
-  console.log('MODE', Object.keys(process.env).length)
-  const config = await new Promise(ok => setTimeout(ok, 1000, 'CONFIG'))
-
-  if (is_daemon) {
-    const { type, data } = JSON.parse(env.OPTS)
-    console.log('[DAEMON]', process.ppid, process.pid)
-//  const cmd = api[type] || function help () { console.log(docs()) }
-//  await cmd(data)
-    return
-  } else {
-//  const args = process.argv.slice(2)
-//  const { type, data } = await parse_opts(args)
-
-    const opts = 'STOP'
-    const dir = path.join(__dirname, '.vm')
-
-    const pid = await daemonify(dir, opts)
-    console.log('[CLI]', process.pid, { pid })
-  }
-})().catch(onerror)
-/******************************************************************************
-  DAEMONIFY
-/*****************************************************************************/
-async function daemonify (dir, OPTS) {
-  await fs.mkdir(dir, { recursive: true })
-  const stdout = await fs.open(path.join(dir, 'stdout.log'), 'a')
-  const stderr = await fs.open(path.join(dir, 'stderr.log'), 'a')
-  const stdio = ['ignore', stdout.fd, stderr.fd]
-  const sopts = { env: { OPTS }, cwd: dir, detached: true, stdio }
-  const child = spawn(process.execPath, [__filename], sopts)
-  child.unref()
-  await stdout.close()
-  await stderr.close()
-  return child.pid
-}
-/******************************************************************************
-  DAEMON
-/*****************************************************************************/
-function daemon () {
-  console.log('[DAEMON]', 'TODO: implement')
-//  // -------------------------
-//  // CROSS CLIENT IPC
-//  // -------------------------
-//  const id = `ds-${crypto.randomUUID()}`
-//  const iswin = process.platform === 'win32'
-//  const socket = iswin ? `\\\\.\\pipe\\${id}` : path.join(dir, `.${id}.sock`)
-//  await fs.writeFile('pid.json', JSON.stringify({ pid: process.pid, socket }))
-//  const server = net.createServer() // detached process
-//  server.on('connection', handler)
-//  server.listen(socket)
-//  function handler (socket) { socket.on('data', ondata) }
-//  // Let the root client process close its own children via graceful-goodbye
-//  // Triggers the cleanup logic (similar effect to receiving a process signal)
-//  function ondata (data) {
-//    if (goodbye.exiting) return // Boolean if the exit code is running.
-//    if (data.toString() === 'shutdown') goodbye.exit()
-//  }
-//
+async function cli () {
+  console.log(`[${NAME}] (version)`, version)
+  const { DATA } = (Object.keys(process.env).length === 1) && process.env
+  const opts = JSON.parse(DATA || null)
+  const { type, data } = opts ? {} : await parse_args(process.argv.slice(2))
+  goodbye(async function onshutdown () {
+    await global_cleanup(DATA ? { type: 'run', data: opts } : { type, data })
+  })
+  if (opts) return await init_daemon(opts)
+  const cmd = api[type] || function help () { console.log(docs()) }
+  const result = await cmd(data)
+  console.log(`[${NAME}] ${type}`, process.pid, { data, result })
 }
 /******************************************************************************
   DOCS
 /*****************************************************************************/
 function docs (name = 'ds') {
+  // TODO:07 fix unimplemented flags
+  // TODO:08 brainstorm about additional flags to generate configs used to pipe to run
   return `[HELP]
 
 
@@ -108,7 +68,7 @@ ${name} run [<dirpath>] [--attach]
 
     ssh user@server '${name} /path/to/app' < config.json # remotely via ssh
 
-    # config must contain: { "feedkey": "...", "secret": "..." }
+    # config must contain: { "idkey": "...", "secret": "..." }
 
     # IMPORTANT: after initialization, the persisted config is used
     # and new stdin configuration is no longer accepted
@@ -136,8 +96,8 @@ ${name} end [<dirpath>] [--purge] [--yes]
 /******************************************************************************
   PARSE ARGS
 /*****************************************************************************/
-async function parse_opts (args) {
-  if (!args.length) return { type: 'help' }
+async function parse_args (args) {
+  if (!args.length) return { type: 'help', data: {} }
   const type = args.shift()
   switch (type) {
     case 'run': return { type, data: await run_opts(args) }
@@ -187,23 +147,30 @@ async function parse_opts (args) {
     if (typeof pathname !== 'string' || !pathname.length) {
       fail(`invalid directory path "${pathname}"`)
     }
-    const dir = path.resolve(pathname)
+    const dir = path.resolve(pathname) // uses process.cwd() + normalizes too
+    const parts = dir.split(path.sep)
+    const invalid = parts.some(part => part.toLowerCase() === '.vm')
+    if (invalid) return fail(`cant spawn inside a ".vm" folder like: "${dir}"`)
     try {
       const stat = await fs.stat(dir)
       if (!stat.isDirectory()) fail(`invalid directory path "${dir}"`)
       return dir
     } catch (error) {
       if (error.code === 'ENOENT') return dir
-      fail(error.message || '', { cause: error })
+      fail(`${error}`, { cause: error })
     }
   }
 }
 /******************************************************************************
-  ONSHUTDOWN
+  GLOBAL_CLEANUP
 /*****************************************************************************/
-async function onshutdown () {
-  console.log('TODO: shutdown')
+async function global_cleanup ({ type, data }) {
+  if (type === 'help') return
+  const { dirpath } = data
+  const vmdir = path.join(dirpath, '.vm')
+  console.log('TODO: IMPLEMENT proper shutdown:', vmdir, { type, data })
 
+  // TODO:09 make `cwd: dir` not be the `...path/.vm` but just the `...path` folder
 //  goodbye(async function () {
 //    console.log('i am run before exit')
 //  })
@@ -217,10 +184,7 @@ async function onshutdown () {
 /******************************************************************************
   ONERROR
 /*****************************************************************************/
-function onerror (error) {
-  console.error(error)
-  process.exit(1)
-}
+function onerror (error) { return EXIT({ exitCode: 1, error }) }
 /******************************************************************************
   FAIL
 /*****************************************************************************/
@@ -231,37 +195,348 @@ function fail (msg, ...args) {
   throw error
 }
 /******************************************************************************
-  API RUN
+  EXIT
 /*****************************************************************************/
-async function run (opts) {
-  console.log('[RUN]', opts)
-  const { dirpath } = opts
-  const storage = path.join(dirpath, '.vm')
-  // requires JSON on stdin, validates it + saves/persists it as 0600 config.json 
+async function EXIT (context) {
+  var cleanup_error
+  try {
+    const { error, exitCode = error ? 1 : 0, reason, cleanup } = context
+    try { await cleanup?.() }
+    catch (error) { cleanup_error = error }
+    process.exitCode = cleanup_error && !exitCode ? 1 : exitCode
+    console.log(`[${NAME}] (daemon) shutdown:`, reason)
+    if (error) console.error(error)
+    if (cleanup_error) console.error(cleanup_error)
+    // TODO:10 do some proper cleanup so it self exits, e.g
+    // everything that needs cleanup should register cleanup handlers
+    if (!goodbye.exiting) return await goodbye.exit()
+  } catch (error) {
+    console.error(error)
+    // process.exitCode = 1 // work towards removing all explicity `.exit(..) calls
+    // => so that process exits on its own
+    process.exit(1)
+  }
+}
+/******************************************************************************
+  DAEMON
+/*****************************************************************************/
+async function init_daemon (data) {
+  const { dirpath } = data
+  const vmdir = path.join(dirpath, '.vm')
+  console.log(`[${NAME}] (daemon)`, 'TODO: implement', vmdir, { type: 'd-run', data })
+  // TODO:11(soon): when required as a module, make sure daemon management is done appropriately too ... maybe run or launch daemon without detach mode,
+  // BUT: maybe this file is already the daemon and it was either run attached or detached
+  // => ...or maybe not? ...confusion!!!
+  // -------------------------------------------------------
+  // LOAD & VALIDATE: LOCK + CONFIG
+  // -------------------------------------------------------
+  const lockpath = path.join(vmdir, 'lock.json')
+  const confpath = path.join(vmdir, 'conf.json')
+  const conf = await read_json(confpath)
+  const config = await load_config(conf)
+  const oldlock = await read_json(lockpath)
+  const lock = await load_lock(oldlock, config.idkey)
+  const other = await claim(lockpath, lock, { force: !!oldlock })
+  if (other) return fail(`daemon runs with PID "${other.pid}" since ${other.time}`)
+  // Losing daemon exits before opening servers, modifying state, or starting work.
+  console.log('[DAEMON] running') // Daemon is in charge now!
+  // => successfully CLAIMED LOCK
+  if (!conf) {
+    try {
+      const json = JSON.stringify(config, null, 2) + '\n'
+      await fs.writeFile(confpath, json, { flag: 'wx', mode: 0o600 })
+    } catch (error) { fail(`${error}`, { cause: error }) }
+  }
+  const { idkey, secret } = config
+  const { time, pid, id } = lock
   /*
-  await fs.mkdir(pathname, { recursive: true })
-  process.chdir(pathname)
-
-  const config = await exists(file) ? await read(file) : await init(file)
-  console.log('hello world', config)
+  idkey     user-supplied globally unique daemon identity
+  id        deterministic local identifier derived from idkey
+  lock      prevents concurrent use of one local daemon directory
+  socket    provides IPC to the daemon associated with that directory
   */
-  async function exists (file) {
-    try { return (await fs.access(file), true) } catch { return false }
+
+  // =>
+  // either ERROR timeout, no config received
+  // or ERROR config corrupt, not parent readable, not parent closable, etc..
+  // or provide the json read from parent
+  // or json read locally
+
+  // TODO:12 + create a README file that allows anyone to learn about the `.vm/...` folder, unless it already exists
+  const READMEmd = path.join(vmdir, 'README.md')
+
+
+  console.log(`[${NAME}] (daemon)`, { confpath, READMEmd, pid, id, time })
+
+
+  const signals = { shutdown: onshutdown_signal }
+  await onsignal(vmdir, id, signals)
+
+  // ...
+  // TODO:13 maybe even initialize or load corestore before logging "ready" to console
+  console.log('ready')
+  return
+  // -------------------------------------------------------
+  async function onshutdown_signal () {
+    // TODO:14
+    // Triggers the cleanup logic (similar effect to receiving a process signal)
+    // Let the daemon process close its own children via graceful-goodbye
+    // TODO:15 notify parent about win?
+    return EXIT({ exitCode: 0, reason: 'IPC shutdown signal received' })
   }
-  // --------------------------------------------------------------------------
-  async function read (file) {
-    return JSON.parse(await fs.readFile(file, 'utf8'))
+  // -------------------------------------------------------
+  async function onsignal (dir, id, on) {
+    const iswin = process.platform === 'win32'
+    const endpoint = iswin ? `\\\\.\\pipe\\${id}` : path.join(dir, `.${id}.sock`)
+    const { resolve, reject, promise: ready } = Promise.withResolvers()
+    const server = net.createServer() // for signals to detached process
+    server.once('error', onerror)
+    server.once('listening', onlistening)
+    server.on('connection', onconnection)
+    if (!iswin) await fs.rm(endpoint, { force: true })
+    server.listen(endpoint)
+    await ready
+    // return { server, endpoint } // not really needed, so not returned
+    function onerror (error) {
+      server.removeListener('listening', onlistening)
+      reject(error)
+    }
+    function onlistening () {
+      server.removeListener('error', onerror)
+      server.on('error', onruntimeerror)
+      resolve()
+    }
+    function onruntimeerror (error) {
+      // TODO:16 maybe restart signal listening server, but why did this happen?
+      // -> unclear state, better shut down the daemon
+      // --> or even better maybe restart the daemon?
+      // --> but thats maybe unnecessary downtime, so maybe just ignore?
+      const reason = 'IPC signal listening error'
+      EXIT({ exitCode: 1, error, reason })
+    }
+    function onconnection (socket) {
+      // TODO:17 does the client send a `ready` signal to parent
+      // => or will the parent already notice when the socket opens?
+      // -> IMPORTANT if the socket can carry initial info, that might be enough!
+      socket.on('error', error => {
+        console.error(`[${NAME}] (daemon)`, `IPC socket error`, error)
+      })
+      socket.on('data', async data => {
+        if (goodbye.exiting) return // Boolean if the exit code is running
+        const signal = data.toString()
+        const handler = on[signal]
+        if (!handler) console.log(`[${NAME}] (daemon)`, `unknown signal "${signal}"`)
+        else try { await handler() } catch (error) {
+          const context = (signal === 'shutdown') ? {
+            exitCode: 1,
+            reason: 'graceful goodbye cleanup fail',
+            error,
+            cleanup,
+          } : {
+            exitCode: 1,
+            reason: `${data} signal processing failure`,
+            error,
+            cleanup,
+          }
+          await EXIT(context)
+        }
+      })
+      // TODO:18 any sent signal is technically a single message and then should close
+      // and if NO signal is sent, it should immediately close
+      // if custom data can be provided by the sender or initiator with the `socket`
+      // -> then NO message is needed, because the `socket` property can contain
+      // the value that identifies the signal
+    }
+    async function cleanup () {
+      const { resolve, reject, promise } = Promise.withResolvers()
+      server.close(err => err ? reject(err) : resolve())
+      await promise
+    }
   }
-  // --------------------------------------------------------------------------
-  async function init (file) {
-    const input = await receive({ timeout: 2000, limit: 64 * 1024 })
-    const config = JSON.parse(input)
-    const opts = { flag: 'wx', mode: 0o600 }
-    await fs.writeFile(file, JSON.stringify(config, null, 2) + '\n', opts)
+  // -------------------------------------------------------
+  async function read_json (filepath) {
+    try { return JSON.parse(await fs.readFile(filepath, 'utf8')) }
+    catch (error) {
+      if (error.code === 'ENOENT') return
+      fail(`invalid json "${filepath}"`, { cause: error })
+    }
+  }
+  // -------------------------------------------------------
+  function isvalid_lock (lock) {
+    const invalid = !lock || typeof lock !== 'object'
+    if (invalid) fail(`corrupted - invalid lockfile`)
+    const valid_pid = Number.isInteger(lock.pid) && lock.pid > 1
+    const valid_id = typeof lock.id === 'string'
+    // TODO:19 id should be hex or z32 of hypercore discoveryKey
+    // => use hex if a core does not automatically provide a z32 string of it
+    if (!valid_pid) fail(`corrupted - invalid lockfile pid`)
+    if (!valid_id) fail(`corrupted - invalid lockfile id`)
+    return true
+  }
+  // -------------------------------------------------------
+  function isvalid_config (config) {
+    // idkey globally identifies one daemon.
+    // Reusing an idkey in another directory is invalid configuration.
+    // idkey is expected to be globally unique.
+    // The caller is responsible for never reusing it for another daemon identity.
+    const { idkey, secret } = config
+    // idkey is a user-managed globally unique identity.
+    // This process only enforces local directory ownership and does not verify
+    // uniqueness across directories, machines, copied configurations, or backups.
+    // TODO:20 implement config validation
+    // -> to avoid spawning something that persists an invalid config
+    // -> secret should be a a hypercore encryption key encoded as string
+    // -> idkey should be a hypercore feedkey encoded as string
+    return true
+  }
+  // -------------------------------------------------------
+  function receive_config ({ timeout = 5000, limit = 64 * 1024  } = {}, done) {
+    const timer = setTimeout(stop, timeout, 'No config received')
+    const { resolve, reject, promise } = Promise.withResolvers()
+    filesystem.readFile(3, 'utf8', stop)
+    return promise.then(cleanup)
+    function stop (error, json) {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try {
+        if (error) return fail(`${error}`, { cause: error })
+        if (Buffer.byteLength(json) > limit) return fail('Config is too large')
+        try { resolve(JSON.parse(json)) }
+        catch (error) { fail(`${error}`, { cause: error }) }
+      } catch (error) { return reject(error) }
+    }
+    async function cleanup (config, validationError, closeError) {
+      try { isvalid_config(config) } catch (error) { validationError = error }
+      try {
+        const { resolve, reject, promise } = Promise.withResolvers()
+        filesystem.close(3, error => error ? reject(error) : resolve())
+        await promise
+      } catch (error) { closeError = error }
+
+      if (validationError) {
+        if (closeError) validationError.closeError = closeError
+        throw validationError
+      }
+      if (closeError) throw closeError
+      return config
+    }
+  }
+  // -------------------------------------------------------
+  async function load_config (conf) {
+    const config = conf ? (isvalid_config(conf), conf) : await receive_config()
     return config
   }
+  // -------------------------------------------------------
+  async function load_lock (oldlock, idkey) {
+    if (oldlock) {
+      isvalid_lock(oldlock)
+      const { pid, id, time } = oldlock
+      // TODO:21(maybe): maybe use id based endpoint to check running?
+      if (is_running(pid)) return fail(`daemon runs with PID "${pid}" since ${time}`)
+    }
+    const time = Date.now()
+    const pid = process.pid
+    const id = b4a.toString(crypto.data(b4a.from(idkey, 'utf8')), 'hex')
+    const lock = { id, pid, time }
+    return lock
+    function is_running (pid) {
+    /* TODO:22
+    For absolute race-safety during stale-file replacement, the existing daemon should be checked through its id based endpoint and the state file should include a unique startup token. For this type of local CLI, the retry loop is generally adequate.
+
+    // Prefer verifying the daemon through its IPC endpoint
+    // rather than relying only on the PID, because PIDs can be reused.
+    */
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch (error) {
+        if (error.code === 'ESRCH') return false
+        if (error.code === 'EPERM') return true
+        fail(`${error}`, { cause: error })
+      }
+    }
+  }
+  // -------------------------------------------------------
+  async function claim (lockpath, lock, opts) {
+    const data = JSON.stringify(lock)
+    const { force } = opts
+    const { resolve, reject, promise } = Promise.withResolvers()
+    try {
+      await fs.writeFile(lockpath, data, { flag: force ? 'w' : 'wx', mode: 0o600 })
+      resolve()
+    } catch (error) {
+      if (error.code === 'EEXIST') resolve(error)
+      else try { fail(`${error}`, { cause: error }) } catch (err) { reject(err) }
+    }
+    const error = await promise
+    if (force) await new Promise(ok => setTimeout(ok, 100)) // delay to avoid race
+    // 1. only in case a stale lockfile exists
+    // 2. and more than one new daemon at the exact same time
+    // 3. and both find the stale lockfile at the exact same time too
+    // 4. and one writes a new lock, waits for 100ms and reads it back
+    // 5. but the other new daemon only writes their lock afer those 100ms delay
+    // => this seems impossibly unlikely
+    // only if nodejs had a native `flock` it could be improved further
+    // XXX: if this problem is not addressed, 2 daemons could run, which risks
+    // -> concurrent write to hypercores using the same keypair
+    // -> which risks data corruption
+    const other = await read_json(lockpath)
+    isvalid_lock(other)
+    if (!force && error) return other
+    const success = lock.pid === other.pid && lock.id === other.id
+    return success ? null : other
+  }
+}
+/******************************************************************************
+  API RUN
+/*****************************************************************************/
+async function run (data, detached = true, child, stdout, stderr) {
+  const { dirpath } = data
+  const vmdir = path.join(dirpath, '.vm')
+  const confpath = path.join(vmdir, 'conf.json')
+  const json = await get_config(confpath)
+  await fs.mkdir(vmdir, { recursive: true, mode: 0o700 }) // always succeeds
+  try {
+     // can all still read when using `0o600` ?
+    stdout = await fs.open(path.join(vmdir, 'stdout.log'), 'a', 0o600)
+    stderr = await fs.open(path.join(vmdir, 'stderr.log'), 'a', 0o600)
+    const DATA = JSON.stringify(data)
+    const stdio = ['ignore', stdout.fd, stderr.fd]
+    if (json) stdio.push('pipe')
+    const opts = { env: { DATA }, cwd: dirpath, detached, stdio }
+
+    child = spawn(process.execPath, [__filename], opts)
+    const spawned = new Promise((resolve, reject) => {
+      child.once('spawn', onspawn)
+      child.once('error', onerror)
+      function onspawn () {
+        child.removeListener('error', onerror)
+        resolve()
+      }
+      function onerror (error) {
+        child.removeListener('spawn', onspawn)
+        reject(error)
+      }
+    })
+    if (json) child.stdio[3].end(json)
+    await spawned
+    child.unref()
+    return child.pid
+  } catch (error) {
+    return fail('failed to spawn daemon', { cause: error })
+  } finally {
+    const all = await Promise.allSettled([stdout?.close(), stderr?.close()])
+    const failure = all.find(p => p.status === 'rejected')
+    if (failure) fail(`${failure.reason}`, { cause: failure.reason })
+  }
   // --------------------------------------------------------------------------
-  function receive ({ timeout, limit }) {
+  async function get_config (confpath, opts = {}, done) {
+    const { timeout = 5000, limit = 64 * 1024  } = opts
+    try { return void await fs.readFile(confpath, 'utf8') } // return undefined
+    catch (error) {
+      if (error.code !== 'ENOENT') fail('config corruption', { cause: error })
+    }
     const { promise, resolve, reject } = Promise.withResolvers()
     let input = ''
     const timer = setTimeout(stop, timeout, 'No config received')
@@ -270,6 +545,7 @@ async function run (opts) {
     process.stdin.once('end', onend)
     process.stdin.once('error', stop)
     process.stdin.resume()
+    console.log(`[${NAME}] waiting to receive initial config...`)
     return promise
     function ondata (chunk) {
       input += chunk
@@ -280,34 +556,48 @@ async function run (opts) {
       stop(null, input)
     }
     function stop (error, value) {
+      if (done) return
+      done = true
       clearTimeout(timer)
       process.stdin.pause()
       process.stdin.removeListener('data', ondata)
       process.stdin.removeListener('end', onend)
       process.stdin.removeListener('error', stop)
-      if (error) fail(error).catch(reject)
-      else resolve(value)
+      if (error) {
+        try { fail(`${error}`, { cause: error }) } catch (err) { reject(err) }
+        return
+      }
+      console.log(`[${NAME}] config received`)
+      resolve(value)
     }
   }
 }
-
 /******************************************************************************
   API SEE
 /*****************************************************************************/
-async function see (opts) {
-  console.log('[SEE]', opts)
+async function see (data) {
+  const { dirpath } = data
+  const vmdir = path.join(dirpath, '.vm')
+  console.log('[SEE] TODO: implement', vmdir, { type: 'see', data })
+  // TODO:23 fix see function
 }
 /******************************************************************************
   API END
 /*****************************************************************************/
-async function end (opts) {
-  console.log('[END]', opts)
+async function end (data) {
+  const { dirpath } = data
+  const vmdir = path.join(dirpath, '.vm')
+  console.log('[END] TODO: implement', vmdir, { type: 'end', data })
+  // TODO:24 implement proper daemon termination
+  // TODO:25 including deleting `.vm` after propmting user if no `--yes` flag given
+  // TODO:26 think about pros/cons of wiping storage, because it can always be done
+  //  -> IMPORTANT: by using `rm -rf ./.vm` for example, so why bother?
   // -------------------------
   // CROSS SERVER IPC PID
   // -------------------------
 //  const { socket } = JSON.parse(await fs.readFile('pid.json'))
 //  const client = net.connect(socket, onopen)
-
+  // TODO:27 fix this end function
   async function onopen () { // cli later
     // send shutdown over your persisted socket/pipe
     client.end('shutdown')
@@ -339,6 +629,6 @@ async function end (opts) {
   //  }
   //
   }
-
 }
 /*****************************************************************************/
+
